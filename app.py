@@ -110,7 +110,6 @@ elif page == "2. System Forecast Generation":
             df_total = df_filtered.groupby('Date')['Sales_Volume'].sum().reset_index()
             
             st.markdown(f"**Analyzing {len(df_filtered)} filtered records.**")
-            st.line_chart(df_total.set_index('Date')['Sales_Volume'], height=200)
             
             horizon = st.number_input("Forecast Horizon (Months)", min_value=1, max_value=24, value=6)
             
@@ -118,11 +117,10 @@ elif page == "2. System Forecast Generation":
                 methods = ["SMA", "SES", "DES", "Croston", "MLR", "Auto-ARIMA"]
                 results_list = []
                 
-                # Simulated loop for demonstration of the Best Fit architecture
+                # Loop for demonstration of the Best Fit architecture
                 for method in methods:
-                    # 1. Generate Forecast per method (Placeholder for actual math models)
-                    # 2. Calculate metrics: MAPE, Bias, Accuracy
-                    mape = np.random.uniform(5, 20) # Simulated values
+                    # 1. Calculate metrics: MAPE, Bias, Accuracy (Simulated)
+                    mape = np.random.uniform(5, 20) 
                     bias = np.random.uniform(-5, 5)
                     accuracy = 100 - mape
                     
@@ -133,10 +131,39 @@ elif page == "2. System Forecast Generation":
                         "Bias": round(bias, 2)
                     })
                     
+                    # 2. Simulate Fitted Values (Backdated forecast for the historical period)
+                    # We use the generated MAPE to create realistic-looking deviations from the actuals
+                    np.random.seed(len(method)) # Seed to keep charts consistent upon re-renders
+                    variance = np.random.normal(0, mape / 100, len(df_total))
+                    fitted_values = df_total['Sales_Volume'] * (1 + variance)
+                    
                     # 3. Graphing in different windows
-                    with st.expander(f"View Forecast: {method}"):
-                        st.write(f"Graphing performance for {method} (Actual vs Model Prediction)...")
-                        # Placeholder for actual Plotly code per method
+                    with st.expander(f"View Forecast vs Actuals: {method}"):
+                        fig = go.Figure()
+                        # Plot Actual Data
+                        fig.add_trace(go.Scatter(
+                            x=df_total['Date'], 
+                            y=df_total['Sales_Volume'], 
+                            mode='lines+markers', 
+                            name='Actual Sales',
+                            line=dict(color='blue')
+                        ))
+                        # Plot Simulated Fitted Data (Backdated Forecast)
+                        fig.add_trace(go.Scatter(
+                            x=df_total['Date'], 
+                            y=fitted_values, 
+                            mode='lines+markers', 
+                            name=f'{method} Fit',
+                            line=dict(color='orange', dash='dot')
+                        ))
+                        
+                        fig.update_layout(
+                            title=f"Historical Model Fit: {method} (MAPE: {mape:.2f}%)", 
+                            xaxis_title="Date", 
+                            yaxis_title="Volume",
+                            hovermode="x unified"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
                 
                 # Store results in session state
                 results_df = pd.DataFrame(results_list)
@@ -145,7 +172,7 @@ elif page == "2. System Forecast Generation":
             # Display Accuracy Table and Finalize Selection
             if st.session_state.get('best_fit_results') is not None:
                 st.subheader("Model Comparison Matrix")
-                st.table(st.session_state['best_fit_results'])
+                st.dataframe(st.session_state['best_fit_results'], use_container_width=True)
                 
                 selected_method = st.selectbox("Select the Best Fit Method:", 
                                                st.session_state['best_fit_results']['Method'])
@@ -155,7 +182,7 @@ elif page == "2. System Forecast Generation":
                     last_date = df_total['Date'].max()
                     future_dates = [last_date + pd.DateOffset(months=i) for i in range(1, horizon + 1)]
                     
-                    # Dummy math to simulate the selected model's output
+                    # Dummy math to simulate the selected model's future output
                     baseline_val = df_total['Sales_Volume'].tail(3).mean() if not df_total.empty else 0
                     forecast_vals = [baseline_val] * horizon
                         
