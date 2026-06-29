@@ -200,7 +200,7 @@ elif page == "2. System Forecast Generation":
                             # Fit the real Auto-ARIMA model with Yearly seasonality applied
                             arima_model = pm.auto_arima(actuals, 
                                                         seasonal=True, 
-                                                        m=12,  # Yearly cyclicity 
+                                                        m=6,  # Yearly cyclicity 
                                                         suppress_warnings=True, 
                                                         error_action="ignore")
                             
