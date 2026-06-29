@@ -2,7 +2,31 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
+import warnings
+from statsmodels.tsa.holtwinters import SimpleExpSmoothing
+from sklearn.linear_model import LinearRegression
+import pmdarima as pm
+
+# Suppress statsmodels warnings for cleaner terminal output
+warnings.filterwarnings("ignore")
+
+# --- Helper Function for True Error Metrics ---
+def calculate_error_metrics(actual, forecast):
+    # Create masks to drop NaNs and align arrays
+    mask = ~np.isnan(actual) & ~np.isnan(forecast)
+    a, f = actual[mask], forecast[mask]
+    
+    if len(a) == 0: 
+        return 0, 0, 0
+        
+    # Prevent division by zero in MAPE
+    a_safe = np.where(a == 0, 1e-5, a)
+    
+    mape = np.mean(np.abs((a - f) / a_safe)) * 100
+    bias = (np.sum(f - a) / np.sum(a)) * 100 if np.sum(a) != 0 else 0
+    accuracy = max(0, 100 - mape)
+    
+    return round(accuracy, 2), round(mape, 2), round(bias, 2)
 
 # --- Configuration & Session State Initialization ---
 st.set_page_config(page_title="Demand Planning Tool", layout="wide")
@@ -18,6 +42,8 @@ if 'filtered_historical_total' not in st.session_state:
     st.session_state['filtered_historical_total'] = None
 if 'best_fit_results' not in st.session_state:
     st.session_state['best_fit_results'] = None
+if 'model_forecast_dict' not in st.session_state:
+    st.session_state['model_forecast_dict'] = {} # Stores future forecasts for each method
 
 # --- Main Navigation ---
 st.sidebar.title("DILOP Workflow")
@@ -33,7 +59,7 @@ st.sidebar.divider()
 # --- Page 1: Data Management ---
 if page == "1. Data Management":
     st.title("Data Management (Collect Input Data)")
-    st.markdown("Upload your transactional data. Ensure it contains the necessary hierarchies and causal drivers.")
+    st.markdown("Hi Nupur Mam!! Please upload your transaction data. Ensure it contains the necessary hierarchies and causal drivers.")
     
     required_columns = [
         'Date', 'Region', 'State', 'Brand', 'SKU', 'Location', 'Customer_Name', 
@@ -44,29 +70,21 @@ if page == "1. Data Management":
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
-        
         missing_cols = [col for col in required_columns if col not in df.columns]
         
         if not missing_cols:
-            # Handle NA values
             df['Marketing_Spend'] = df['Marketing_Spend'].fillna(0)
             df['Discount_Pct'] = df['Discount_Pct'].fillna(0)
             
             # Format Date to the 1st of the month
             df['Date'] = pd.to_datetime(df['Date']).dt.to_period('M').dt.to_timestamp()
             
-            # Aggregate at the monthly level by all dimensions
-            agg_dict = {
-                'Sales_Volume': 'sum',
-                'Marketing_Spend': 'sum',
-                'Discount_Pct': 'mean'
-            }
+            # Aggregate at the monthly level
+            agg_dict = {'Sales_Volume': 'sum', 'Marketing_Spend': 'sum', 'Discount_Pct': 'mean'}
             group_cols = ['Date', 'Region', 'State', 'Brand', 'SKU', 'Location', 'Customer_Name']
-            df_monthly = df.groupby(group_cols).agg(agg_dict).reset_index()
+            df_monthly = df.groupby(group_cols).agg(agg_dict).reset_index().sort_values('Date')
             
-            df_monthly = df_monthly.sort_values('Date')
             st.session_state['historical_data'] = df_monthly
-            
             st.success("Data successfully cleaned, aggregated to monthly level, and written to database!")
             st.dataframe(df_monthly.head(10))
         else:
@@ -107,93 +125,142 @@ elif page == "2. System Forecast Generation":
         if df_filtered.empty:
             st.error("No data available for the selected filters. Please adjust your criteria.")
         else:
-            df_total = df_filtered.groupby('Date')['Sales_Volume'].sum().reset_index()
+            # Updated aggregation: We must pull through causal drivers for MLR
+            df_total = df_filtered.groupby('Date').agg({
+                'Sales_Volume': 'sum',
+                'Marketing_Spend': 'sum',
+                'Discount_Pct': 'mean'
+            }).reset_index()
             
             st.markdown(f"**Analyzing {len(df_filtered)} filtered records.**")
             
             horizon = st.number_input("Forecast Horizon (Months)", min_value=1, max_value=24, value=6)
             
             if st.button("Run Best Fit Analysis"):
-                methods = ["SMA", "SES", "DES", "Croston", "MLR", "Auto-ARIMA"]
+                # Expanded methods list
+                methods = ["SMA (3-Month)", "SES (Exponential Smoothing)", "MLR", "Auto-ARIMA"]
                 results_list = []
+                forecast_dict = {}
+                actuals = df_total['Sales_Volume'].values
+                dates = df_total['Date'].values
                 
-                # Loop for demonstration of the Best Fit architecture
                 for method in methods:
-                    # 1. Calculate metrics: MAPE, Bias, Accuracy (Simulated)
-                    mape = np.random.uniform(5, 20) 
-                    bias = np.random.uniform(-5, 5)
-                    accuracy = 100 - mape
-                    
-                    results_list.append({
-                        "Method": method,
-                        "Accuracy": round(accuracy, 2),
-                        "MAPE": round(mape, 2),
-                        "Bias": round(bias, 2)
-                    })
-                    
-                    # 2. Simulate Fitted Values (Backdated forecast for the historical period)
-                    # We use the generated MAPE to create realistic-looking deviations from the actuals
-                    np.random.seed(len(method)) # Seed to keep charts consistent upon re-renders
-                    variance = np.random.normal(0, mape / 100, len(df_total))
-                    fitted_values = df_total['Sales_Volume'] * (1 + variance)
-                    
-                    # 3. Graphing in different windows
-                    with st.expander(f"View Forecast vs Actuals: {method}"):
-                        fig = go.Figure()
-                        # Plot Actual Data
-                        fig.add_trace(go.Scatter(
-                            x=df_total['Date'], 
-                            y=df_total['Sales_Volume'], 
-                            mode='lines+markers', 
-                            name='Actual Sales',
-                            line=dict(color='blue')
-                        ))
-                        # Plot Simulated Fitted Data (Backdated Forecast)
-                        fig.add_trace(go.Scatter(
-                            x=df_total['Date'], 
-                            y=fitted_values, 
-                            mode='lines+markers', 
-                            name=f'{method} Fit',
-                            line=dict(color='orange', dash='dot')
-                        ))
+                    try:
+                        if method == "SMA (3-Month)":
+                            # True 3-Month Simple Moving Average
+                            window = 3
+                            fitted_values = df_total['Sales_Volume'].rolling(window=window).mean().shift(1)
+                            # Fill early NaNs with the first available rolling mean for graphing continuity
+                            fitted_values = fitted_values.bfill().values 
+                            
+                            # Future Forecast
+                            baseline_val = actuals[-window:].mean() if len(actuals) >= window else actuals.mean()
+                            future_forecast = [baseline_val] * horizon
+                            
+                        elif method == "SES (Exponential Smoothing)":
+                            # True Simple Exponential Smoothing via statsmodels
+                            model = SimpleExpSmoothing(actuals, initialization_method="estimated").fit()
+                            fitted_values = model.fittedvalues
+                            
+                            # Future Forecast
+                            future_forecast = model.forecast(horizon).tolist()
+
+                        elif method == "MLR":
+                            # Define independent (X) and dependent (y) variables
+                            X = df_total[['Marketing_Spend', 'Discount_Pct']]
+                            y = df_total['Sales_Volume']
+                            
+                            # Fit the real MLR model
+                            mlr_model = LinearRegression()
+                            mlr_model.fit(X, y)
+                            
+                            # Extract real fitted historical values
+                            fitted_values = mlr_model.predict(X)
+                            
+                            # Generate future baseline forecast
+                            # Note: For a baseline, we project the recent average of marketing & discounts.
+                            recent_marketing = df_total['Marketing_Spend'].tail(3).mean()
+                            recent_discount = df_total['Discount_Pct'].tail(3).mean()
+                            
+                            future_X = pd.DataFrame({
+                                'Marketing_Spend': [recent_marketing] * horizon,
+                                'Discount_Pct': [recent_discount] * horizon
+                            })
+                            future_forecast = mlr_model.predict(future_X).tolist()
+
+                        elif method == "Auto-ARIMA":
+                            # Fit the real Auto-ARIMA model
+                            arima_model = pm.auto_arima(actuals, 
+                                                        seasonal=False, 
+                                                        suppress_warnings=True, 
+                                                        error_action="ignore")
+                            
+                            # Extract real fitted historical values
+                            fitted_values = arima_model.predict_in_sample()
+                            
+                            # Generate true future baseline forecast for the selected horizon
+                            future_forecast = arima_model.predict(n_periods=horizon).tolist()
+
+                        # 1. Calculate TRUE metrics
+                        accuracy, mape, bias = calculate_error_metrics(actuals, fitted_values)
                         
-                        fig.update_layout(
-                            title=f"Historical Model Fit: {method} (MAPE: {mape:.2f}%)", 
-                            xaxis_title="Date", 
-                            yaxis_title="Volume",
-                            hovermode="x unified"
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                        results_list.append({
+                            "Method": method,
+                            "Accuracy": accuracy,
+                            "MAPE": mape,
+                            "Bias": bias
+                        })
+                        
+                        # Store future forecast in dictionary for Step 3 transfer
+                        forecast_dict[method] = future_forecast
+                        
+                        # 2. Graphing the True Fit
+                        with st.expander(f"View Forecast vs Actuals: {method}"):
+                            fig = go.Figure()
+                            # Actuals
+                            fig.add_trace(go.Scatter(
+                                x=df_total['Date'], y=actuals, mode='lines+markers', 
+                                name='Actual Sales', line=dict(color='blue')
+                            ))
+                            # Fitted (Backdated Forecast)
+                            fig.add_trace(go.Scatter(
+                                x=df_total['Date'], y=fitted_values, mode='lines+markers', 
+                                name=f'{method} Fit', line=dict(color='orange', dash='dot')
+                            ))
+                            fig.update_layout(
+                                title=f"Historical Model Fit: {method} (MAPE: {mape:.2f}%)", 
+                                xaxis_title="Date", yaxis_title="Volume", hovermode="x unified"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                    except Exception as e:
+                        st.error(f"Error calculating {method}: {str(e)}")
                 
                 # Store results in session state
-                results_df = pd.DataFrame(results_list)
-                st.session_state['best_fit_results'] = results_df
+                st.session_state['best_fit_results'] = pd.DataFrame(results_list)
+                st.session_state['model_forecast_dict'] = forecast_dict
                 
             # Display Accuracy Table and Finalize Selection
             if st.session_state.get('best_fit_results') is not None:
                 st.subheader("Model Comparison Matrix")
                 st.dataframe(st.session_state['best_fit_results'], use_container_width=True)
                 
-                selected_method = st.selectbox("Select the Best Fit Method:", 
-                                               st.session_state['best_fit_results']['Method'])
+                selected_method = st.selectbox("Select the Best Fit Method:", st.session_state['best_fit_results']['Method'])
                 
                 if st.button("Finalize and Lock Baseline"):
-                    # Generate a baseline for the selected method to pass to Step 3
+                    # Pull the true calculated future forecast for the winning model
+                    winning_forecast = st.session_state['model_forecast_dict'][selected_method]
+                    
                     last_date = df_total['Date'].max()
                     future_dates = [last_date + pd.DateOffset(months=i) for i in range(1, horizon + 1)]
-                    
-                    # Dummy math to simulate the selected model's future output
-                    baseline_val = df_total['Sales_Volume'].tail(3).mean() if not df_total.empty else 0
-                    forecast_vals = [baseline_val] * horizon
                         
-                    forecast_df = pd.DataFrame({'Date': future_dates, 'Baseline_Forecast': forecast_vals})
+                    forecast_df = pd.DataFrame({'Date': future_dates, 'Baseline_Forecast': winning_forecast})
                     
                     st.session_state['system_forecast'] = forecast_df
                     st.session_state['filtered_historical_total'] = df_total
                     
-                    st.success(f"System baseline locked using {selected_method}.")
+                    st.success(f"System baseline locked using true statistical output from {selected_method}.")
                 
-                # Download Button (Rendered outside the st.button to prevent Streamlit reset behavior)
                 if st.session_state['system_forecast'] is not None:
                     csv = st.session_state['system_forecast'].to_csv(index=False)
                     st.download_button(
