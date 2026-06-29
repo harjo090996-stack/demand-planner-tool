@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 import warnings
-from statsmodels.tsa.holtwinters import SimpleExpSmoothing
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.linear_model import LinearRegression
 import pmdarima as pm
 
@@ -43,7 +44,11 @@ if 'filtered_historical_total' not in st.session_state:
 if 'best_fit_results' not in st.session_state:
     st.session_state['best_fit_results'] = None
 if 'model_forecast_dict' not in st.session_state:
-    st.session_state['model_forecast_dict'] = {} # Stores future forecasts for each method
+    st.session_state['model_forecast_dict'] = {} 
+if 'trained_mlr_model' not in st.session_state:
+    st.session_state['trained_mlr_model'] = None
+if 'default_mlr_future_X' not in st.session_state:
+    st.session_state['default_mlr_future_X'] = None
 
 # --- Main Navigation ---
 st.sidebar.title("DILOP Workflow")
@@ -137,8 +142,8 @@ elif page == "2. System Forecast Generation":
             horizon = st.number_input("Forecast Horizon (Months)", min_value=1, max_value=24, value=6)
             
             if st.button("Run Best Fit Analysis"):
-                # Expanded methods list
-                methods = ["SMA (3-Month)", "SES (Exponential Smoothing)", "MLR", "Auto-ARIMA"]
+                # Updated Methods list 
+                methods = ["SMA (3-Month)", "Holt-Winters (Exponential Smoothing)", "MLR", "Auto-ARIMA"]
                 results_list = []
                 forecast_dict = {}
                 actuals = df_total['Sales_Volume'].values
@@ -157,9 +162,10 @@ elif page == "2. System Forecast Generation":
                             baseline_val = actuals[-window:].mean() if len(actuals) >= window else actuals.mean()
                             future_forecast = [baseline_val] * horizon
                             
-                        elif method == "SES (Exponential Smoothing)":
-                            # True Simple Exponential Smoothing via statsmodels
-                            model = SimpleExpSmoothing(actuals, initialization_method="estimated").fit()
+                        elif method == "Holt-Winters (Exponential Smoothing)":
+                            # Updated to Holt-Winters using Exponential Smoothing from statsmodels
+                            # trend='add' (linear trend), seasonal param can also be applied based on needs
+                            model = ExponentialSmoothing(actuals, trend='add', initialization_method="estimated").fit()
                             fitted_values = model.fittedvalues
                             
                             # Future Forecast
@@ -173,12 +179,13 @@ elif page == "2. System Forecast Generation":
                             # Fit the real MLR model
                             mlr_model = LinearRegression()
                             mlr_model.fit(X, y)
+                            st.session_state['trained_mlr_model'] = mlr_model  # Save for custom input later
                             
                             # Extract real fitted historical values
                             fitted_values = mlr_model.predict(X)
                             
                             # Generate future baseline forecast
-                            # Note: For a baseline, we project the recent average of marketing & discounts.
+                            # Default uses recent average, this gets saved to session state for the grid
                             recent_marketing = df_total['Marketing_Spend'].tail(3).mean()
                             recent_discount = df_total['Discount_Pct'].tail(3).mean()
                             
@@ -186,12 +193,14 @@ elif page == "2. System Forecast Generation":
                                 'Marketing_Spend': [recent_marketing] * horizon,
                                 'Discount_Pct': [recent_discount] * horizon
                             })
+                            st.session_state['default_mlr_future_X'] = future_X
                             future_forecast = mlr_model.predict(future_X).tolist()
 
                         elif method == "Auto-ARIMA":
-                            # Fit the real Auto-ARIMA model
+                            # Fit the real Auto-ARIMA model with Yearly seasonality applied
                             arima_model = pm.auto_arima(actuals, 
-                                                        seasonal=False, 
+                                                        seasonal=True, 
+                                                        m=12,  # Yearly cyclicity 
                                                         suppress_warnings=True, 
                                                         error_action="ignore")
                             
@@ -247,9 +256,39 @@ elif page == "2. System Forecast Generation":
                 
                 selected_method = st.selectbox("Select the Best Fit Method:", st.session_state['best_fit_results']['Method'])
                 
+                # Dynamic Logic for MLR Selection Grid Override
+                edited_mlr_inputs = None
+                if selected_method == "MLR":
+                    st.markdown("#### Adjust MLR Causal Drivers")
+                    st.info("Because MLR relies on Marketing Spend and Discounts, please input your future plans below to dynamically generate the baseline.")
+                    
+                    last_date = df_total['Date'].max()
+                    future_dates = [last_date + pd.DateOffset(months=i) for i in range(1, horizon + 1)]
+                    
+                    # Construct default dataframe for editor
+                    default_mlr_grid = st.session_state['default_mlr_future_X'].copy()
+                    default_mlr_grid.insert(0, 'Date', [d.strftime('%b %Y') for d in future_dates])
+                    
+                    edited_mlr_inputs = st.data_editor(
+                        default_mlr_grid,
+                        column_config={
+                            "Date": st.column_config.Column("Future Horizon Month", disabled=True),
+                            "Marketing_Spend": st.column_config.NumberColumn("Planned Marketing Spend"),
+                            "Discount_Pct": st.column_config.NumberColumn("Planned Discount %")
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                
                 if st.button("Finalize and Lock Baseline"):
-                    # Pull the true calculated future forecast for the winning model
-                    winning_forecast = st.session_state['model_forecast_dict'][selected_method]
+                    if selected_method == "MLR" and edited_mlr_inputs is not None:
+                        # Recalculate MLR forecast using the user's custom inputs
+                        mlr_model = st.session_state['trained_mlr_model']
+                        custom_X = edited_mlr_inputs[['Marketing_Spend', 'Discount_Pct']]
+                        winning_forecast = mlr_model.predict(custom_X).tolist()
+                    else:
+                        # Pull standard calculated future forecast for other winning models
+                        winning_forecast = st.session_state['model_forecast_dict'][selected_method]
                     
                     last_date = df_total['Date'].max()
                     future_dates = [last_date + pd.DateOffset(months=i) for i in range(1, horizon + 1)]
